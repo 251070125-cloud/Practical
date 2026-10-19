@@ -1,0 +1,217 @@
+
+# Weather Analysis App
+# Install once: install.packages("shiny")
+
+library(shiny)
+
+ui <- fluidPage(
+  titlePanel("Weather Analysis App"),
+
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload Weather CSV",
+                accept = ".csv"),
+
+      numericInput("normal", "Normal Rainfall (mm)",
+                   value = 100, min = 0),
+
+      numericInput("sigma", "Known Population SD of Rainfall",
+                   value = 20, min = 0.01),
+
+      numericInput("median", "Claimed Median Rainfall (mm)",
+                   value = 100, min = 0),
+
+      numericInput("temp", "Temperature for Prediction",
+                   value = 30),
+
+      numericInput("humidity", "Humidity for Prediction",
+                   value = 70, min = 0, max = 100),
+
+      actionButton("analyze", "Analyze Weather")
+    ),
+
+    mainPanel(
+      h3("Statistical Results"),
+      verbatimTextOutput("results"),
+      h3("Rainfall vs Temperature"),
+      plotOutput("graph"),
+      h3("Rainfall Distribution"),
+      plotOutput("hist")
+    )
+  )
+)
+
+server <- function(input, output) {
+
+  analysis <- eventReactive(input$analyze, {
+    req(input$file)
+
+   d <- read.csv(
+  input$file$datapath,
+  fileEncoding = "UTF-8-BOM",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+    required <- c("Rainfall", "Temperature",
+                  "Humidity", "Season")
+
+    validate(
+      need(all(required %in% names(d)),
+           "CSV must contain Rainfall, Temperature, Humidity and Season."),
+      need(nrow(d) >= 3, "Enter at least 3 observations.")
+    )
+
+    d$Rainfall <- as.numeric(d$Rainfall)
+    d$Temperature <- as.numeric(d$Temperature)
+    d$Humidity <- as.numeric(d$Humidity)
+
+    validate(
+      need(all(is.finite(d$Rainfall)) &&
+           all(is.finite(d$Temperature)) &&
+           all(is.finite(d$Humidity)),
+           "Weather columns must contain valid numeric values."),
+      need(all(d$Rainfall >= 0),
+           "Rainfall cannot be negative."),
+      need(input$sigma > 0,
+           "Population standard deviation must be positive.")
+    )
+
+    # 1. Z-test for mean rainfall
+    n <- length(d$Rainfall)
+    z <- (mean(d$Rainfall) - input$normal) /
+         (input$sigma / sqrt(n))
+    pz <- 2 * pnorm(-abs(z))
+
+    # 2. 95% confidence interval for mean temperature
+    ci <- t.test(d$Temperature, conf.level = 0.95)
+
+    # 3. Multiple linear regression
+    model <- lm(Rainfall ~ Temperature + Humidity,
+                data = d)
+
+    predicted <- predict(
+      model,
+      newdata = data.frame(
+        Temperature = input$temp,
+        Humidity = input$humidity
+      )
+    )
+
+    # 4. Sign test for claimed median rainfall
+    diff <- d$Rainfall - input$median
+    diff <- diff[diff != 0]
+
+    sign_result <- if (length(diff) > 0) {
+      binom.test(sum(diff > 0), length(diff), p = 0.5)
+    } else {
+      NULL
+    }
+
+    # 5. Mann-Whitney U test
+    monsoon <- d$Rainfall[
+      tolower(trimws(d$Season)) == "monsoon"
+    ]
+
+    nonmonsoon <- d$Rainfall[
+      tolower(trimws(d$Season)) %in%
+        c("non-monsoon", "nonmonsoon", "non monsoon")
+    ]
+
+    mw <- if (length(monsoon) > 0 &&
+              length(nonmonsoon) > 0) {
+      wilcox.test(monsoon, nonmonsoon,
+                  exact = FALSE)
+    } else {
+      NULL
+    }
+
+    list(d = d, z = z, pz = pz, ci = ci,
+         model = model, predicted = predicted,
+         sign = sign_result, mw = mw,
+         nsign = length(diff))
+  })
+
+  output$results <- renderPrint({
+    a <- analysis()
+
+    cat("WEATHER ANALYSIS RESULTS\n")
+    cat("========================\n\n")
+
+    cat("1. Z-TEST FOR MEAN RAINFALL\n")
+    cat("Z value:", round(a$z, 3), "\n")
+    cat("P value:", round(a$pz, 4), "\n")
+
+    if (a$pz < 0.05) {
+      cat("Conclusion: Reject H0. Mean rainfall differs",
+          "significantly from the claimed value.\n\n")
+    } else {
+      cat("Conclusion: Fail to reject H0. There is",
+          "insufficient evidence of a difference.\n\n")
+    }
+
+    cat("2. 95% CONFIDENCE INTERVAL FOR TEMPERATURE\n")
+    print(a$ci$conf.int)
+    cat("Mean temperature:", round(mean(a$d$Temperature), 2),
+        "°C\n\n")
+
+    cat("3. REGRESSION ANALYSIS\n")
+    print(summary(a$model))
+    cat("\nPredicted rainfall:",
+        round(a$predicted, 2), "mm\n\n")
+
+    cat("4. SIGN TEST FOR MEDIAN RAINFALL\n")
+    if (!is.null(a$sign)) {
+      print(a$sign)
+
+      if (a$sign$p.value < 0.05) {
+        cat("Conclusion: Reject H0. The median differs",
+            "significantly from the claimed value.\n\n")
+      } else {
+        cat("Conclusion: Fail to reject H0. There is",
+            "insufficient evidence that the median differs",
+            "from the claimed value.\n\n")
+      }
+    } else {
+      cat("Test cannot be performed: all rainfall values",
+          "equal the claimed median.\n\n")
+    }
+
+    cat("5. MANN-WHITNEY U TEST\n")
+    if (!is.null(a$mw)) {
+      print(a$mw)
+
+      if (a$mw$p.value < 0.05) {
+        cat("Conclusion: Rainfall distributions differ",
+            "significantly between the two seasons.\n")
+      } else {
+        cat("Conclusion: No statistically significant",
+            "difference was detected between seasons.\n")
+      }
+    } else {
+      cat("Provide observations from both Monsoon and",
+          "Non-Monsoon seasons.\n")
+    }
+  })
+
+  output$graph <- renderPlot({
+    a <- analysis()
+    plot(a$d$Temperature, a$d$Rainfall,
+         main = "Rainfall vs Temperature",
+         xlab = "Temperature (°C)",
+         ylab = "Rainfall (mm)",
+         pch = 19)
+    abline(lm(Rainfall ~ Temperature, data = a$d))
+  })
+
+  output$hist <- renderPlot({
+    a <- analysis()
+    hist(a$d$Rainfall,
+         main = "Distribution of Monthly Rainfall",
+         xlab = "Rainfall (mm)",
+         col = "lightblue",
+         border = "white")
+  })
+}
+
+shinyApp(ui = ui, server = server)
